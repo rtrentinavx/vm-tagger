@@ -2,6 +2,11 @@
 VM Tagger — bulk-tag VMs in Azure and AWS from a CSV/Excel input file.
 GUI mode: python tagger.py
 CLI mode: python tagger.py --input vms.csv [--dry-run]
+
+Input format (one row per VM):
+  cloud, subscription_or_account, resource_group_or_region, vm_name, tags
+  tags cell: semicolon-separated key=value pairs
+  e.g.  Environment=Production;Owner=OIT-Cloud;CostCenter=123
 """
 
 import argparse
@@ -9,7 +14,7 @@ import csv
 import sys
 import threading
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 try:
@@ -24,18 +29,17 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class TagRow:
-    cloud: str                          # "azure" | "aws"
-    subscription_or_account: str        # Azure subscription ID or AWS account ID
-    resource_group_or_region: str       # Azure RG name or AWS region
+class VMRow:
+    cloud: str                      # "azure" | "aws"
+    subscription_or_account: str    # Azure subscription ID or AWS account ID
+    resource_group_or_region: str   # Azure RG name or AWS region
     vm_name: str
-    tag_key: str
-    tag_value: str
+    tags: dict                      # {key: value, ...}
 
 
 @dataclass
 class TagResult:
-    row: TagRow
+    row: VMRow
     success: bool
     message: str = ""
 
@@ -44,14 +48,14 @@ class TagResult:
 # Input parsing
 # ---------------------------------------------------------------------------
 
-def load_input(path: str) -> list[TagRow]:
+def load_input(path: str) -> list[VMRow]:
     p = Path(path)
     if p.suffix.lower() in (".xlsx", ".xls"):
         return _load_excel(p)
     return _load_csv(p)
 
 
-def _load_csv(path: Path) -> list[TagRow]:
+def _load_csv(path: Path) -> list[VMRow]:
     rows = []
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -62,7 +66,7 @@ def _load_csv(path: Path) -> list[TagRow]:
     return rows
 
 
-def _load_excel(path: Path) -> list[TagRow]:
+def _load_excel(path: Path) -> list[VMRow]:
     if not HAS_OPENPYXL:
         raise ImportError("openpyxl is required for Excel files: pip install openpyxl")
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -81,27 +85,48 @@ def _load_excel(path: Path) -> list[TagRow]:
     return rows
 
 
-def _parse_record(record: dict, line: int) -> Optional[TagRow]:
-    required = ["cloud", "subscription_or_account", "resource_group_or_region",
-                "vm_name", "tag_key", "tag_value"]
+def _parse_tags(raw: str) -> dict:
+    """Parse 'Key1=Val1;Key2=Val2' into a dict. Skips malformed pairs."""
+    tags = {}
+    for pair in raw.split(";"):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            continue
+        k, _, v = pair.partition("=")
+        k, v = k.strip(), v.strip()
+        if k:
+            tags[k] = v
+    return tags
+
+
+def _parse_record(record: dict, line: int) -> Optional[VMRow]:
+    required = ["cloud", "subscription_or_account", "resource_group_or_region", "vm_name", "tags"]
     for col in required:
         if not record.get(col, "").strip():
             return None  # skip blank/incomplete rows
-    return TagRow(
+    tags = _parse_tags(record["tags"])
+    if not tags:
+        return None  # tags cell present but unparseable — skip
+    return VMRow(
         cloud=record["cloud"].strip().lower(),
         subscription_or_account=record["subscription_or_account"].strip(),
         resource_group_or_region=record["resource_group_or_region"].strip(),
         vm_name=record["vm_name"].strip(),
-        tag_key=record["tag_key"].strip(),
-        tag_value=record["tag_value"].strip(),
+        tags=tags,
     )
+
+
+def _tags_summary(tags: dict) -> str:
+    return "  ".join(f"{k}={v}" for k, v in tags.items())
 
 
 # ---------------------------------------------------------------------------
 # Azure tagging
 # ---------------------------------------------------------------------------
 
-def tag_azure_vm(row: TagRow, dry_run: bool) -> TagResult:
+def tag_azure_vm(row: VMRow, dry_run: bool) -> TagResult:
     try:
         from azure.identity import DefaultAzureCredential
         from azure.mgmt.compute import ComputeManagementClient
@@ -109,18 +134,19 @@ def tag_azure_vm(row: TagRow, dry_run: bool) -> TagResult:
         return TagResult(row, False, "azure-identity / azure-mgmt-compute not installed")
 
     if dry_run:
-        return TagResult(row, True, f"[DRY-RUN] would tag {row.vm_name} → {row.tag_key}={row.tag_value}")
+        return TagResult(row, True,
+                         f"[DRY-RUN] would apply {len(row.tags)} tag(s): {_tags_summary(row.tags)}")
 
     try:
         credential = DefaultAzureCredential()
         client = ComputeManagementClient(credential, row.subscription_or_account)
         vm = client.virtual_machines.get(row.resource_group_or_region, row.vm_name)
-        tags = vm.tags or {}
-        tags[row.tag_key] = row.tag_value
+        merged = {**(vm.tags or {}), **row.tags}
         client.virtual_machines.begin_update(
-            row.resource_group_or_region, row.vm_name, {"tags": tags}
+            row.resource_group_or_region, row.vm_name, {"tags": merged}
         ).result()
-        return TagResult(row, True, f"Tagged {row.vm_name} → {row.tag_key}={row.tag_value}")
+        return TagResult(row, True,
+                         f"Applied {len(row.tags)} tag(s): {_tags_summary(row.tags)}")
     except Exception as exc:
         return TagResult(row, False, str(exc))
 
@@ -129,24 +155,19 @@ def tag_azure_vm(row: TagRow, dry_run: bool) -> TagResult:
 # AWS tagging
 # ---------------------------------------------------------------------------
 
-def tag_aws_vm(row: TagRow, dry_run: bool) -> TagResult:
+def tag_aws_vm(row: VMRow, dry_run: bool) -> TagResult:
     try:
         import boto3
-        from botocore.exceptions import BotoCoreError, ClientError
     except ImportError:
         return TagResult(row, False, "boto3 not installed")
 
     if dry_run:
-        return TagResult(row, True, f"[DRY-RUN] would tag {row.vm_name} → {row.tag_key}={row.tag_value}")
+        return TagResult(row, True,
+                         f"[DRY-RUN] would apply {len(row.tags)} tag(s): {_tags_summary(row.tags)}")
 
     try:
-        ec2 = boto3.client(
-            "ec2",
-            region_name=row.resource_group_or_region,
-            # AWS account switching: assumes the calling identity has access.
-            # For cross-account, set up AWS profiles or assume-role externally.
-        )
-        # Accept either instance ID (i-xxx) or Name tag lookup
+        ec2 = boto3.client("ec2", region_name=row.resource_group_or_region)
+
         if row.vm_name.startswith("i-"):
             instance_ids = [row.vm_name]
         else:
@@ -163,9 +184,10 @@ def tag_aws_vm(row: TagRow, dry_run: bool) -> TagResult:
 
         ec2.create_tags(
             Resources=instance_ids,
-            Tags=[{"Key": row.tag_key, "Value": row.tag_value}],
+            Tags=[{"Key": k, "Value": v} for k, v in row.tags.items()],
         )
-        return TagResult(row, True, f"Tagged {row.vm_name} ({instance_ids}) → {row.tag_key}={row.tag_value}")
+        return TagResult(row, True,
+                         f"Applied {len(row.tags)} tag(s) to {instance_ids}: {_tags_summary(row.tags)}")
     except Exception as exc:
         return TagResult(row, False, str(exc))
 
@@ -174,20 +196,12 @@ def tag_aws_vm(row: TagRow, dry_run: bool) -> TagResult:
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-def process_rows(rows: list[TagRow], dry_run: bool,
-                 progress_cb=None) -> list[TagResult]:
-    results = []
-    for i, row in enumerate(rows):
-        if row.cloud == "azure":
-            result = tag_azure_vm(row, dry_run)
-        elif row.cloud == "aws":
-            result = tag_aws_vm(row, dry_run)
-        else:
-            result = TagResult(row, False, f"Unknown cloud: {row.cloud}")
-        results.append(result)
-        if progress_cb:
-            progress_cb(i + 1, len(rows), result)
-    return results
+def _apply(row: VMRow, dry_run: bool) -> TagResult:
+    if row.cloud == "azure":
+        return tag_azure_vm(row, dry_run)
+    if row.cloud == "aws":
+        return tag_aws_vm(row, dry_run)
+    return TagResult(row, False, f"Unknown cloud: {row.cloud!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -196,19 +210,13 @@ def process_rows(rows: list[TagRow], dry_run: bool,
 
 def run_cli(input_path: str, dry_run: bool):
     rows = load_input(input_path)
-    print(f"Loaded {len(rows)} tag operations from {input_path}")
+    print(f"Loaded {len(rows)} VM(s) from {input_path}")
     if dry_run:
         print("DRY-RUN mode — no changes will be applied\n")
 
     ok = err = 0
-    for i, row in enumerate(rows):
-        if row.cloud == "azure":
-            result = tag_azure_vm(row, dry_run)
-        elif row.cloud == "aws":
-            result = tag_aws_vm(row, dry_run)
-        else:
-            result = TagResult(row, False, f"Unknown cloud: {row.cloud}")
-
+    for row in rows:
+        result = _apply(row, dry_run)
         status = "OK " if result.success else "ERR"
         print(f"[{status}] {row.cloud.upper():5s} {row.vm_name:40s} {result.message}")
         if result.success:
@@ -261,8 +269,7 @@ class TaggerApp:
         self.file_var = tk.StringVar()
         ttk.Entry(file_frame, textvariable=self.file_var, width=60).grid(
             row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(file_frame, text="Browse…", command=self._browse).grid(
-            row=0, column=2)
+        ttk.Button(file_frame, text="Browse…", command=self._browse).grid(row=0, column=2)
 
         # --- Options row ---
         opt_frame = ttk.Frame(root, padding=(8, 0, 8, 8))
@@ -294,9 +301,9 @@ class TaggerApp:
         self.log = scrolledtext.ScrolledText(log_frame, height=20, wrap=tk.WORD,
                                              font=("Courier", 10))
         self.log.grid(row=0, column=0, sticky="nsew")
-        self.log.tag_config("ok",  foreground="#1a9850")
-        self.log.tag_config("err", foreground="#d73027")
-        self.log.tag_config("dry", foreground="#4393c3")
+        self.log.tag_config("ok",   foreground="#1a9850")
+        self.log.tag_config("err",  foreground="#d73027")
+        self.log.tag_config("dry",  foreground="#4393c3")
         self.log.tag_config("info", foreground="#666666")
 
     def _browse(self):
@@ -319,12 +326,10 @@ class TaggerApp:
         if not path:
             self._log("Please select an input file.", "err")
             return
-
         self.run_btn.config(state="disabled")
         self.progress["value"] = 0
         self.progress_label.config(text="")
         self._log(f"Loading {path} …", "info")
-
         threading.Thread(target=self._worker, args=(path,), daemon=True).start()
 
     def _worker(self, path: str):
@@ -337,29 +342,21 @@ class TaggerApp:
             return
 
         self.root.after(0, self._log,
-                        f"Loaded {len(rows)} operations. "
+                        f"Loaded {len(rows)} VM(s).  "
                         f"{'DRY-RUN — no changes will be applied.' if dry_run else 'LIVE mode.'}",
                         "dry" if dry_run else "info")
 
         ok = err = 0
         for i, row in enumerate(rows, 1):
-            if row.cloud == "azure":
-                result = tag_azure_vm(row, dry_run)
-            elif row.cloud == "aws":
-                result = tag_aws_vm(row, dry_run)
-            else:
-                result = TagResult(row, False, f"Unknown cloud: {row.cloud}")
-
-            tag = "dry" if dry_run else ("ok" if result.success else "err")
+            result = _apply(row, dry_run)
+            log_tag = "dry" if dry_run else ("ok" if result.success else "err")
             label = "[DRY]" if dry_run else ("[OK ]" if result.success else "[ERR]")
             msg = f"{label} {row.cloud.upper():5s} {row.vm_name:40s} {result.message}"
-            self.root.after(0, self._log, msg, tag)
-
+            self.root.after(0, self._log, msg, log_tag)
             if result.success:
                 ok += 1
             else:
                 err += 1
-
             pct = int(i / len(rows) * 100)
             self.root.after(0, self._set_progress, pct, f"{i}/{len(rows)}")
 
@@ -388,7 +385,7 @@ def main():
     else:
         tk, _fd, _st, _ttk = _import_tkinter()
         root = tk.Tk()
-        app = TaggerApp(root)
+        TaggerApp(root)
         root.mainloop()
 
 
