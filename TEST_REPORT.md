@@ -4,6 +4,7 @@
 **Tester:** Ricardo Trentin
 **Tool version:** main / e2c2370
 **Input file:** `samples/test_run.csv`
+**Status:** COMPLETED — test resources deprovisioned
 
 ---
 
@@ -99,6 +100,17 @@ Done — 6 succeeded, 1 failed
 | i-0569ff04a074f4780 | Environment=Dev, CostCenter=456, Department=Engineering, Team=Platform, Name=tagger-test-ec2-3 (pre-existing) |
 
 **Pre-existing `Name` tags were preserved** — merge behavior confirmed.
+
+---
+
+## Deprovisioning
+
+Test resources terminated on 2026-07-24 after test completion.
+
+| Cloud | Resource | Action |
+|-------|----------|--------|
+| Azure | vm-tagger-test-rg (+ all 3 VMs) | Resource group deleted |
+| AWS | i-0f4b9dddc1b2204d2, i-02f85514dc2a56857, i-0569ff04a074f4780 | Instances terminated (us-east-2) |
 
 ---
 

@@ -85,6 +85,8 @@ The tool uses the standard boto3 credential chain:
 
 The identity used must have the **ec2:CreateTags** and **ec2:DescribeInstances** permissions on the target accounts.
 
+> **Note on AWS_PROFILE:** If your shell has `AWS_PROFILE` set to an SSO profile with expired tokens, the tool automatically clears it at startup so that static credentials in `~/.aws/credentials` take effect. Use `--aws-profile` to explicitly select a named profile instead.
+
 ---
 
 ## Running the GUI
@@ -173,4 +175,5 @@ Done — 3 succeeded, 1 failed
 | `No module named '_tkinter'` | Tkinter native binding missing | `brew install python-tk` |
 | `AuthorizationFailed` (Azure) | Identity lacks permission on the subscription | Assign **Virtual Machine Contributor** role |
 | `NoCredentialsError` (AWS) | No AWS credentials found | Run `aws configure` or set env vars |
+| SSO token errors on AWS even with static keys in `~/.aws/credentials` | `AWS_PROFILE` env var is set and points to an expired SSO profile | The tool clears `AWS_PROFILE` automatically at startup. Set `AWS_PROFILE_KEEP=1` to suppress this behavior and manage the profile yourself. |
 | `No instance found with Name=…` (AWS) | VM name not found via Name tag | Use the instance ID (`i-0abc…`) instead |
