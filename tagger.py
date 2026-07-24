@@ -1,7 +1,7 @@
 """
 VM Tagger — bulk-tag VMs in Azure and AWS from a CSV/Excel input file.
 GUI mode: python tagger.py
-CLI mode: python tagger.py --input vms.csv [--dry-run]
+CLI mode: python tagger.py --input vms.csv [--dry-run] [--aws-profile PROFILE]
 
 Input format (one row per VM):
   cloud, subscription_or_account, resource_group_or_region, vm_name, tags
@@ -155,18 +155,20 @@ def tag_azure_vm(row: VMRow, dry_run: bool) -> TagResult:
 # AWS tagging
 # ---------------------------------------------------------------------------
 
-def tag_aws_vm(row: VMRow, dry_run: bool) -> TagResult:
+def tag_aws_vm(row: VMRow, dry_run: bool, aws_profile: Optional[str] = None) -> TagResult:
     try:
         import boto3
     except ImportError:
         return TagResult(row, False, "boto3 not installed")
 
+    profile_note = f" (profile={aws_profile})" if aws_profile else ""
     if dry_run:
         return TagResult(row, True,
-                         f"[DRY-RUN] would apply {len(row.tags)} tag(s): {_tags_summary(row.tags)}")
+                         f"[DRY-RUN] would apply {len(row.tags)} tag(s){profile_note}: {_tags_summary(row.tags)}")
 
     try:
-        ec2 = boto3.client("ec2", region_name=row.resource_group_or_region)
+        session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+        ec2 = session.client("ec2", region_name=row.resource_group_or_region)
 
         if row.vm_name.startswith("i-"):
             instance_ids = [row.vm_name]
@@ -187,7 +189,7 @@ def tag_aws_vm(row: VMRow, dry_run: bool) -> TagResult:
             Tags=[{"Key": k, "Value": v} for k, v in row.tags.items()],
         )
         return TagResult(row, True,
-                         f"Applied {len(row.tags)} tag(s) to {instance_ids}: {_tags_summary(row.tags)}")
+                         f"Applied {len(row.tags)} tag(s) to {instance_ids}{profile_note}: {_tags_summary(row.tags)}")
     except Exception as exc:
         return TagResult(row, False, str(exc))
 
@@ -196,11 +198,11 @@ def tag_aws_vm(row: VMRow, dry_run: bool) -> TagResult:
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-def _apply(row: VMRow, dry_run: bool) -> TagResult:
+def _apply(row: VMRow, dry_run: bool, aws_profile: Optional[str] = None) -> TagResult:
     if row.cloud == "azure":
         return tag_azure_vm(row, dry_run)
     if row.cloud == "aws":
-        return tag_aws_vm(row, dry_run)
+        return tag_aws_vm(row, dry_run, aws_profile=aws_profile)
     return TagResult(row, False, f"Unknown cloud: {row.cloud!r}")
 
 
@@ -208,15 +210,18 @@ def _apply(row: VMRow, dry_run: bool) -> TagResult:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def run_cli(input_path: str, dry_run: bool):
+def run_cli(input_path: str, dry_run: bool, aws_profile: Optional[str] = None):
     rows = load_input(input_path)
     print(f"Loaded {len(rows)} VM(s) from {input_path}")
     if dry_run:
-        print("DRY-RUN mode — no changes will be applied\n")
+        print("DRY-RUN mode — no changes will be applied")
+    if aws_profile:
+        print(f"AWS profile: {aws_profile}")
+    print()
 
     ok = err = 0
     for row in rows:
-        result = _apply(row, dry_run)
+        result = _apply(row, dry_run, aws_profile=aws_profile)
         status = "OK " if result.success else "ERR"
         print(f"[{status}] {row.cloud.upper():5s} {row.vm_name:40s} {result.message}")
         if result.success:
@@ -279,6 +284,12 @@ class TaggerApp:
         ttk.Checkbutton(opt_frame, text="Dry-run (preview only, no changes)",
                         variable=self.dry_run_var).grid(row=0, column=0, sticky="w")
 
+        ttk.Label(opt_frame, text="AWS profile:").grid(row=0, column=1, sticky="w", padx=(20, 4))
+        self.aws_profile_var = tk.StringVar()
+        ttk.Entry(opt_frame, textvariable=self.aws_profile_var, width=20).grid(row=0, column=2, sticky="w")
+        ttk.Label(opt_frame, text="(leave blank for default)", foreground="#888888").grid(
+            row=0, column=3, sticky="w", padx=(4, 0))
+
         # --- Action buttons ---
         btn_frame = ttk.Frame(root, padding=(8, 0, 8, 8))
         btn_frame.grid(row=2, column=0, sticky="ew")
@@ -329,10 +340,11 @@ class TaggerApp:
         self.run_btn.config(state="disabled")
         self.progress["value"] = 0
         self.progress_label.config(text="")
+        aws_profile = self.aws_profile_var.get().strip() or None
         self._log(f"Loading {path} …", "info")
-        threading.Thread(target=self._worker, args=(path,), daemon=True).start()
+        threading.Thread(target=self._worker, args=(path, aws_profile), daemon=True).start()
 
-    def _worker(self, path: str):
+    def _worker(self, path: str, aws_profile: Optional[str]):
         dry_run = self.dry_run_var.get()
         try:
             rows = load_input(path)
@@ -341,14 +353,15 @@ class TaggerApp:
             self.root.after(0, self.run_btn.config, {"state": "normal"})
             return
 
-        self.root.after(0, self._log,
-                        f"Loaded {len(rows)} VM(s).  "
-                        f"{'DRY-RUN — no changes will be applied.' if dry_run else 'LIVE mode.'}",
-                        "dry" if dry_run else "info")
+        parts = [f"Loaded {len(rows)} VM(s).",
+                 "DRY-RUN — no changes will be applied." if dry_run else "LIVE mode."]
+        if aws_profile:
+            parts.append(f"AWS profile: {aws_profile}")
+        self.root.after(0, self._log, "  ".join(parts), "dry" if dry_run else "info")
 
         ok = err = 0
         for i, row in enumerate(rows, 1):
-            result = _apply(row, dry_run)
+            result = _apply(row, dry_run, aws_profile=aws_profile)
             log_tag = "dry" if dry_run else ("ok" if result.success else "err")
             label = "[DRY]" if dry_run else ("[OK ]" if result.success else "[ERR]")
             msg = f"{label} {row.cloud.upper():5s} {row.vm_name:40s} {result.message}"
@@ -378,10 +391,12 @@ def main():
     parser.add_argument("--input", help="CSV or Excel input file (omit for GUI)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview operations without making changes")
+    parser.add_argument("--aws-profile", metavar="PROFILE",
+                        help="AWS credentials profile from ~/.aws/credentials")
     args = parser.parse_args()
 
     if args.input:
-        run_cli(args.input, args.dry_run)
+        run_cli(args.input, args.dry_run, aws_profile=args.aws_profile)
     else:
         tk, _fd, _st, _ttk = _import_tkinter()
         root = tk.Tk()
