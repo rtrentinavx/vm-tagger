@@ -85,30 +85,44 @@ def _load_excel(path: Path) -> list[VMRow]:
     return rows
 
 
-def _parse_tags(raw: str) -> dict:
-    """Parse 'Key1=Val1;Key2=Val2' into a dict. Skips malformed pairs."""
+def _parse_tags(raw: str) -> tuple[dict, list[str]]:
+    """Parse 'Key1=Val1;Key2=Val2' into (dict, warnings). Skips empty keys or values."""
     tags = {}
+    warnings = []
     for pair in raw.split(";"):
         pair = pair.strip()
         if not pair:
             continue
         if "=" not in pair:
+            warnings.append(f"malformed pair {pair!r} (no '=')")
             continue
         k, _, v = pair.partition("=")
         k, v = k.strip(), v.strip()
-        if k:
-            tags[k] = v
-    return tags
+        if not k:
+            warnings.append(f"empty key in pair {pair!r}")
+            continue
+        if not v:
+            warnings.append(f"empty value for key {k!r}")
+            continue
+        tags[k] = v
+    return tags, warnings
 
 
 def _parse_record(record: dict, line: int) -> Optional[VMRow]:
     required = ["cloud", "subscription_or_account", "resource_group_or_region", "vm_name", "tags"]
+    vm_name = record.get("vm_name", "").strip() or f"<line {line}>"
     for col in required:
         if not record.get(col, "").strip():
-            return None  # skip blank/incomplete rows
-    tags = _parse_tags(record["tags"])
+            print(f"[WARN] line {line} ({vm_name}): missing or empty field '{col}' — skipped",
+                  file=sys.stderr)
+            return None
+    tags, tag_warnings = _parse_tags(record["tags"])
+    for w in tag_warnings:
+        print(f"[WARN] line {line} ({vm_name}): {w}", file=sys.stderr)
     if not tags:
-        return None  # tags cell present but unparseable — skip
+        print(f"[WARN] line {line} ({vm_name}): no valid tags after parsing — skipped",
+              file=sys.stderr)
+        return None
     return VMRow(
         cloud=record["cloud"].strip().lower(),
         subscription_or_account=record["subscription_or_account"].strip(),
@@ -316,6 +330,7 @@ class TaggerApp:
         self.log.tag_config("err",  foreground="#d73027")
         self.log.tag_config("dry",  foreground="#4393c3")
         self.log.tag_config("info", foreground="#666666")
+        self.log.tag_config("warn", foreground="#e07b00")
 
     def _browse(self):
         path = self._filedialog.askopenfilename(
@@ -345,9 +360,18 @@ class TaggerApp:
         threading.Thread(target=self._worker, args=(path, aws_profile), daemon=True).start()
 
     def _worker(self, path: str, aws_profile: Optional[str]):
+        import io
         dry_run = self.dry_run_var.get()
         try:
-            rows = load_input(path)
+            stderr_capture = io.StringIO()
+            _old_stderr, sys.stderr = sys.stderr, stderr_capture
+            try:
+                rows = load_input(path)
+            finally:
+                sys.stderr = _old_stderr
+            for line in stderr_capture.getvalue().splitlines():
+                if line.strip():
+                    self.root.after(0, self._log, line, "warn")
         except Exception as exc:
             self.root.after(0, self._log, f"Failed to load file: {exc}", "err")
             self.root.after(0, self.run_btn.config, {"state": "normal"})
