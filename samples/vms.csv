@@ -1,0 +1,5 @@
+cloud,subscription_or_account,resource_group_or_region,vm_name,tag_key,tag_value
+azure,09ee524e-513d-4f21-b758-43277a3b84b2,AZUSC-M-CLHB-NET-PRD-RG,my-vm-1,Environment,Production
+azure,09ee524e-513d-4f21-b758-43277a3b84b2,AZUSC-M-CLHB-NET-PRD-RG,my-vm-1,Owner,OIT-Cloud
+aws,390403887416,us-east-1,my-ec2-instance,Environment,Production
+aws,390403887416,us-east-1,my-ec2-instance,Owner,OIT-Cloud
