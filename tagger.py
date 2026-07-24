@@ -387,6 +387,14 @@ class TaggerApp:
 # ---------------------------------------------------------------------------
 
 def main():
+    import os
+    # If AWS_PROFILE is set in the environment but points to an SSO profile
+    # with expired tokens, boto3 will fail even though ~/.aws/credentials has
+    # valid static keys. Clear it here so the credentials file wins by default;
+    # --aws-profile re-sets it explicitly if the user wants a named profile.
+    if not os.environ.get("AWS_PROFILE_KEEP"):
+        os.environ.pop("AWS_PROFILE", None)
+
     parser = argparse.ArgumentParser(description="Bulk-tag VMs in Azure and AWS")
     parser.add_argument("--input", help="CSV or Excel input file (omit for GUI)")
     parser.add_argument("--dry-run", action="store_true",

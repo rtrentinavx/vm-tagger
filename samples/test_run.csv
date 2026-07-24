@@ -1,0 +1,8 @@
+cloud,subscription_or_account,resource_group_or_region,vm_name,tags
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,vm-tagger-test-rg,tagger-test-vm1,Environment=Production;Owner=OIT-Cloud;CostCenter=123;Project=VMTaggerTest
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,vm-tagger-test-rg,tagger-test-vm2,Environment=Staging;Owner=OIT-Cloud
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,vm-tagger-test-rg,tagger-test-vm3,Environment=Dev;Owner=OIT-Cloud;CostCenter=456
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,vm-tagger-test-rg,tagger-test-vm-DOESNOTEXIST,Environment=Production;Owner=OIT-Cloud
+aws,008440979964,us-east-2,tagger-test-ec2-1,Environment=Production;Owner=OIT-Cloud;CostCenter=123;Project=VMTaggerTest
+aws,008440979964,us-east-2,i-02f85514dc2a56857,Environment=Staging;Owner=OIT-Cloud;Team=Research
+aws,008440979964,us-east-2,i-0569ff04a074f4780,Environment=Dev;CostCenter=456;Department=Engineering;Team=Platform
