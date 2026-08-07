@@ -1,7 +1,10 @@
 """
 VM Tagger — bulk-tag VMs in Azure and AWS from a CSV/Excel input file.
-GUI mode: python tagger.py
-CLI mode: python tagger.py --input vms.csv [--dry-run] [--aws-profile PROFILE]
+GUI mode:      python tagger.py
+CLI mode:      python tagger.py --input vms.csv [--dry-run] [--aws-profile PROFILE]
+Discover mode: python tagger.py --discover [--cloud azure|aws|both] [--output out.csv]
+                                            [--subscription SUB_ID ...] [--region REGION ...]
+                                            [--aws-profile PROFILE]
 
 Input format (one row per VM):
   cloud, subscription_or_account, resource_group_or_region, vm_name, tags
@@ -407,6 +410,141 @@ class TaggerApp:
 
 
 # ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DiscoveredVM:
+    cloud: str
+    subscription_or_account: str
+    resource_group_or_region: str
+    vm_name: str
+
+
+def discover_azure_vms(subscription_ids: list[str]) -> list[DiscoveredVM]:
+    try:
+        from azure.identity import DefaultAzureCredential
+        from azure.mgmt.compute import ComputeManagementClient
+    except ImportError:
+        print("[ERROR] azure-identity / azure-mgmt-compute not installed", file=sys.stderr)
+        return []
+
+    if not subscription_ids:
+        try:
+            from azure.mgmt.subscription import SubscriptionClient
+            credential = DefaultAzureCredential()
+            sub_client = SubscriptionClient(credential)
+            subscription_ids = [s.subscription_id for s in sub_client.subscriptions.list()]
+            print(f"[INFO] Found {len(subscription_ids)} Azure subscription(s)")
+        except Exception as exc:
+            print(f"[ERROR] Could not enumerate Azure subscriptions: {exc}", file=sys.stderr)
+            return []
+
+    vms: list[DiscoveredVM] = []
+    credential = DefaultAzureCredential()
+    for sub_id in subscription_ids:
+        print(f"[INFO] Scanning Azure subscription {sub_id} …")
+        try:
+            client = ComputeManagementClient(credential, sub_id)
+            for vm in client.virtual_machines.list_all():
+                # Resource ID format: /subscriptions/{sub}/resourceGroups/{rg}/providers/…/virtualMachines/{name}
+                parts = (vm.id or "").split("/")
+                rg = ""
+                for i, part in enumerate(parts):
+                    if part.lower() == "resourcegroups" and i + 1 < len(parts):
+                        rg = parts[i + 1]
+                        break
+                vms.append(DiscoveredVM(
+                    cloud="azure",
+                    subscription_or_account=sub_id,
+                    resource_group_or_region=rg,
+                    vm_name=vm.name or "",
+                ))
+        except Exception as exc:
+            print(f"[ERROR] Subscription {sub_id}: {exc}", file=sys.stderr)
+
+    return vms
+
+
+def discover_aws_vms(regions: list[str], aws_profile: Optional[str] = None) -> list[DiscoveredVM]:
+    try:
+        import boto3
+    except ImportError:
+        print("[ERROR] boto3 not installed", file=sys.stderr)
+        return []
+
+    session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+
+    if not regions:
+        try:
+            ec2_global = session.client("ec2", region_name="us-east-1")
+            resp = ec2_global.describe_regions(Filters=[{"Name": "opt-in-status",
+                                                          "Values": ["opt-in-not-required", "opted-in"]}])
+            regions = [r["RegionName"] for r in resp["Regions"]]
+            print(f"[INFO] Found {len(regions)} AWS region(s)")
+        except Exception as exc:
+            print(f"[ERROR] Could not enumerate AWS regions: {exc}", file=sys.stderr)
+            return []
+
+    # Resolve the account ID once
+    try:
+        sts = session.client("sts")
+        account_id = sts.get_caller_identity()["Account"]
+    except Exception:
+        account_id = "unknown"
+
+    vms: list[DiscoveredVM] = []
+    for region in regions:
+        print(f"[INFO] Scanning AWS region {region} …")
+        try:
+            ec2 = session.client("ec2", region_name=region)
+            paginator = ec2.get_paginator("describe_instances")
+            for page in paginator.paginate():
+                for reservation in page["Reservations"]:
+                    for instance in reservation["Instances"]:
+                        instance_id = instance["InstanceId"]
+                        vms.append(DiscoveredVM(
+                            cloud="aws",
+                            subscription_or_account=account_id,
+                            resource_group_or_region=region,
+                            vm_name=instance_id,
+                        ))
+        except Exception as exc:
+            print(f"[ERROR] Region {region}: {exc}", file=sys.stderr)
+
+    return vms
+
+
+def run_discover(cloud: str, output_path: str, subscription_ids: list[str],
+                 regions: list[str], aws_profile: Optional[str] = None):
+    vms: list[DiscoveredVM] = []
+
+    if cloud in ("azure", "both"):
+        azure_vms = discover_azure_vms(subscription_ids)
+        print(f"[INFO] Azure: discovered {len(azure_vms)} VM(s)")
+        vms.extend(azure_vms)
+
+    if cloud in ("aws", "both"):
+        aws_vms = discover_aws_vms(regions, aws_profile=aws_profile)
+        print(f"[INFO] AWS: discovered {len(aws_vms)} VM(s)")
+        vms.extend(aws_vms)
+
+    if not vms:
+        print("[WARN] No VMs discovered — output file not written", file=sys.stderr)
+        return
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["cloud", "subscription_or_account", "resource_group_or_region", "vm_name", "tags"])
+        for vm in vms:
+            writer.writerow([vm.cloud, vm.subscription_or_account,
+                              vm.resource_group_or_region, vm.vm_name, ""])
+
+    print(f"\nDiscovered {len(vms)} VM(s) — written to {output_path}")
+    print("Fill in the 'tags' column, then run:  python tagger.py --input", output_path)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -425,9 +563,24 @@ def main():
                         help="Preview operations without making changes")
     parser.add_argument("--aws-profile", metavar="PROFILE",
                         help="AWS credentials profile from ~/.aws/credentials")
+    parser.add_argument("--discover", action="store_true",
+                        help="Discover VMs and export to CSV for later tagging")
+    parser.add_argument("--cloud", choices=["azure", "aws", "both"], default="both",
+                        help="Cloud(s) to discover (default: both)")
+    parser.add_argument("--output", metavar="FILE", default="discovered_vms.csv",
+                        help="Output CSV path for --discover (default: discovered_vms.csv)")
+    parser.add_argument("--subscription", metavar="SUB_ID", action="append", default=[],
+                        dest="subscriptions",
+                        help="Azure subscription ID to scan (repeatable; default: all accessible)")
+    parser.add_argument("--region", metavar="REGION", action="append", default=[],
+                        dest="regions",
+                        help="AWS region to scan (repeatable; default: all enabled regions)")
     args = parser.parse_args()
 
-    if args.input:
+    if args.discover:
+        run_discover(args.cloud, args.output, args.subscriptions, args.regions,
+                     aws_profile=args.aws_profile)
+    elif args.input:
         run_cli(args.input, args.dry_run, aws_profile=args.aws_profile)
     else:
         tk, _fd, _st, _ttk = _import_tkinter()

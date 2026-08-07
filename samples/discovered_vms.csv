@@ -1,0 +1,10 @@
+cloud,subscription_or_account,resource_group_or_region,vm_name,tags
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,RG-AV-AVX-TRANSIT-VNET-EUS-577173,av-gw-avx-transit-gw-eus,
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,BCM-LAB-RG,av-gw-bcm-lab-spoke1,
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,BCM-LAB-RG,av-gw-bcm-lab-spoke2,
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,BCM-LAB-RG,av-gw-bcm-lab-transit,
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,BCM-LAB-RG,bcm-lab-clinical,
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,BCM-LAB-RG,bcm-lab-data-pipeline,
+azure,47ab116c-8c15-4453-b06a-3fecd09ebda9,BCM-LAB-RG,bcm-lab-spoke2-vm,
+aws,008440979964,us-east-1,i-00df309886403ace6,
+aws,008440979964,us-east-1,i-0cd3e8226aec6a33e,
