@@ -8,12 +8,9 @@ Discover mode: python tagger.py --discover [--cloud azure|aws|both] [--output ou
 
 Input format (one row per resource):
   cloud, subscription_or_account, resource_group_or_region, vm_name, tags[, resource_type]
-  resource_type: vm (default) | vnet | subnet | vpc
+  resource_type: vm (default) | vnet | vpc | subnet
   tags cell: semicolon-separated key=value pairs, e.g. Environment=Production;Owner=OIT-Cloud
-  Azure subnet vm_name: encoded as vnet-name/subnet-name
-
-Note: Azure subnets do not support independent tags in Azure Resource Manager.
-      Use resource_type=vnet to tag the parent VNet instead.
+  subnet is AWS-only (azure+subnet rows are rejected)
 """
 
 import argparse
@@ -132,6 +129,11 @@ def _parse_record(record: dict, line: int) -> Optional[VMRow]:
         print(f"[WARN] line {line} ({vm_name}): unknown resource_type {resource_type!r} — skipped",
               file=sys.stderr)
         return None
+    cloud = record.get("cloud", "").strip().lower()
+    if cloud == "azure" and resource_type == "subnet":
+        print(f"[WARN] line {line} ({vm_name}): Azure does not support subnet tags — skipped",
+              file=sys.stderr)
+        return None
     tags, tag_warnings = _parse_tags(record["tags"])
     for w in tag_warnings:
         print(f"[WARN] line {line} ({vm_name}): {w}", file=sys.stderr)
@@ -207,13 +209,6 @@ def tag_azure_vnet(row: VMRow, dry_run: bool) -> TagResult:
         return TagResult(row, True, f"Applied {len(row.tags)} tag(s): {_tags_summary(row.tags)}")
     except Exception as exc:
         return TagResult(row, False, str(exc))
-
-
-def tag_azure_subnet(row: VMRow, dry_run: bool) -> TagResult:
-    # Azure subnets are sub-resources of VNets and have no independent tags property.
-    return TagResult(row, False,
-                     "Azure subnets do not support independent tags; "
-                     "use resource_type=vnet to tag the parent VNet instead")
 
 
 # ---------------------------------------------------------------------------
@@ -324,8 +319,6 @@ def _apply(row: VMRow, dry_run: bool, aws_profile: Optional[str] = None) -> TagR
     if row.cloud == "azure":
         if rt == "vnet":
             return tag_azure_vnet(row, dry_run)
-        if rt == "subnet":
-            return tag_azure_subnet(row, dry_run)
         return tag_azure_vm(row, dry_run)
     if row.cloud == "aws":
         if rt == "vpc":
@@ -578,20 +571,6 @@ def _discover_azure_vnets(sub_id: str, credential) -> list[DiscoveredResource]:
     return results
 
 
-def _discover_azure_subnets(sub_id: str, credential) -> list[DiscoveredResource]:
-    from azure.mgmt.network import NetworkManagementClient
-    results = []
-    try:
-        client = NetworkManagementClient(credential, sub_id)
-        for vnet in client.virtual_networks.list_all():
-            rg = _rg_from_id(vnet.id)
-            for subnet in client.subnets.list(rg, vnet.name):
-                results.append(DiscoveredResource("azure", sub_id, rg,
-                                                  f"{vnet.name}/{subnet.name}", "subnet"))
-    except Exception as exc:
-        print(f"[ERROR] Subnets in subscription {sub_id}: {exc}", file=sys.stderr)
-    return results
-
 
 def _aws_account_id(session) -> str:
     try:
@@ -669,7 +648,6 @@ def run_discover(cloud: str, output_path: str, subscription_ids: list[str],
                 print(f"[INFO] Scanning Azure subscription {sub_id} …")
                 resources.extend(_discover_azure_vms(sub_id, credential))
                 resources.extend(_discover_azure_vnets(sub_id, credential))
-                resources.extend(_discover_azure_subnets(sub_id, credential))
             print(f"[INFO] Azure: discovered {sum(1 for r in resources if r.cloud == 'azure')} resource(s)")
 
     if cloud in ("aws", "both"):

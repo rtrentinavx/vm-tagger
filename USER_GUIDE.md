@@ -45,10 +45,9 @@ The `resource_type` column is optional — existing files without it continue to
 | `vm` | Virtual Machine name | EC2 instance ID (`i-0abc…`) or Name tag |
 | `vnet` | Virtual Network name | — |
 | `vpc` | — | VPC ID (`vpc-0abc…`) or Name tag |
-| `subnet` | `vnet-name/subnet-name` *(see note below)* | Subnet ID (`subnet-0abc…`) or Name tag |
+| `subnet` | — *(not supported)* | Subnet ID (`subnet-0abc…`) or Name tag |
 
-> **Azure subnet note:** Azure subnets do not support independent tags in Azure Resource Manager.
-> The tool returns a clear error if you try; use `resource_type=vnet` to tag the parent VNet instead.
+> **Azure subnet note:** Azure does not support tags on subnets. Rows with `cloud=azure` and `resource_type=subnet` are skipped with a warning.
 
 ### Tags cell format
 
@@ -268,7 +267,7 @@ Done — 3 succeeded, 1 failed
 | `AuthorizationFailed` (Azure) | Identity lacks permission on the subscription | Assign **Virtual Machine Contributor** role (tagging) or **Reader** role (discovery) |
 | `No module named 'azure.mgmt.subscription'` | `azure-mgmt-subscription` not installed | `pip install -r requirements.txt` |
 | `No module named 'azure.mgmt.network'` | `azure-mgmt-network` not installed | `pip install -r requirements.txt` |
-| `Azure subnets do not support independent tags` | Azure ARM limitation | Use `resource_type=vnet` to tag the parent VNet |
+| `[WARN] Azure does not support subnet tags — skipped` | Azure ARM limitation | Use `resource_type=vnet` to tag the parent VNet |
 | `NoCredentialsError` (AWS) | No AWS credentials found | Run `aws configure` or set env vars |
 | SSO token errors on AWS even with static keys in `~/.aws/credentials` | `AWS_PROFILE` env var is set and points to an expired SSO profile | The tool clears `AWS_PROFILE` automatically at startup. Set `AWS_PROFILE_KEEP=1` to suppress this behavior and manage the profile yourself. |
 | `No instance found with Name=…` (AWS) | VM name not found via Name tag | Use the instance ID (`i-0abc…`) instead |
