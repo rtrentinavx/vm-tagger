@@ -1,15 +1,16 @@
 """
-VM Tagger — bulk-tag VMs in Azure and AWS from a CSV/Excel input file.
+VM Tagger — bulk-tag VMs and network resources in Azure and AWS from a CSV/Excel input file.
 GUI mode:      python tagger.py
 CLI mode:      python tagger.py --input vms.csv [--dry-run] [--aws-profile PROFILE]
 Discover mode: python tagger.py --discover [--cloud azure|aws|both] [--output out.csv]
                                             [--subscription SUB_ID ...] [--region REGION ...]
                                             [--aws-profile PROFILE]
 
-Input format (one row per VM):
-  cloud, subscription_or_account, resource_group_or_region, vm_name, tags
-  tags cell: semicolon-separated key=value pairs
-  e.g.  Environment=Production;Owner=OIT-Cloud;CostCenter=123
+Input format (one row per resource):
+  cloud, subscription_or_account, resource_group_or_region, vm_name, tags[, resource_type]
+  resource_type: vm (default) | vnet | vpc | subnet
+  tags cell: semicolon-separated key=value pairs, e.g. Environment=Production;Owner=OIT-Cloud
+  subnet is AWS-only (azure+subnet rows are rejected)
 """
 
 import argparse
@@ -31,13 +32,17 @@ except ImportError:
 # Data model
 # ---------------------------------------------------------------------------
 
+VALID_RESOURCE_TYPES = {"vm", "vnet", "subnet", "vpc"}
+
+
 @dataclass
 class VMRow:
     cloud: str                      # "azure" | "aws"
     subscription_or_account: str    # Azure subscription ID or AWS account ID
     resource_group_or_region: str   # Azure RG name or AWS region
-    vm_name: str
+    vm_name: str                    # resource name/ID; Azure subnet: "vnet-name/subnet-name"
     tags: dict                      # {key: value, ...}
+    resource_type: str = "vm"       # vm | vnet | subnet | vpc
 
 
 @dataclass
@@ -119,6 +124,16 @@ def _parse_record(record: dict, line: int) -> Optional[VMRow]:
             print(f"[WARN] line {line} ({vm_name}): missing or empty field '{col}' — skipped",
                   file=sys.stderr)
             return None
+    resource_type = record.get("resource_type", "").strip().lower() or "vm"
+    if resource_type not in VALID_RESOURCE_TYPES:
+        print(f"[WARN] line {line} ({vm_name}): unknown resource_type {resource_type!r} — skipped",
+              file=sys.stderr)
+        return None
+    cloud = record.get("cloud", "").strip().lower()
+    if cloud == "azure" and resource_type == "subnet":
+        print(f"[WARN] line {line} ({vm_name}): Azure does not support subnet tags — skipped",
+              file=sys.stderr)
+        return None
     tags, tag_warnings = _parse_tags(record["tags"])
     for w in tag_warnings:
         print(f"[WARN] line {line} ({vm_name}): {w}", file=sys.stderr)
@@ -132,6 +147,7 @@ def _parse_record(record: dict, line: int) -> Optional[VMRow]:
         resource_group_or_region=record["resource_group_or_region"].strip(),
         vm_name=record["vm_name"].strip(),
         tags=tags,
+        resource_type=resource_type,
     )
 
 
@@ -164,6 +180,33 @@ def tag_azure_vm(row: VMRow, dry_run: bool) -> TagResult:
         ).result()
         return TagResult(row, True,
                          f"Applied {len(row.tags)} tag(s): {_tags_summary(row.tags)}")
+    except Exception as exc:
+        return TagResult(row, False, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Azure network tagging
+# ---------------------------------------------------------------------------
+
+def tag_azure_vnet(row: VMRow, dry_run: bool) -> TagResult:
+    try:
+        from azure.identity import DefaultAzureCredential
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        return TagResult(row, False, "azure-identity / azure-mgmt-network not installed")
+
+    if dry_run:
+        return TagResult(row, True,
+                         f"[DRY-RUN] would apply {len(row.tags)} tag(s): {_tags_summary(row.tags)}")
+    try:
+        credential = DefaultAzureCredential()
+        client = NetworkManagementClient(credential, row.subscription_or_account)
+        vnet = client.virtual_networks.get(row.resource_group_or_region, row.vm_name)
+        merged = {**(vnet.tags or {}), **row.tags}
+        client.virtual_networks.begin_update_tags(
+            row.resource_group_or_region, row.vm_name, {"tags": merged}
+        ).result()
+        return TagResult(row, True, f"Applied {len(row.tags)} tag(s): {_tags_summary(row.tags)}")
     except Exception as exc:
         return TagResult(row, False, str(exc))
 
@@ -211,14 +254,77 @@ def tag_aws_vm(row: VMRow, dry_run: bool, aws_profile: Optional[str] = None) -> 
         return TagResult(row, False, str(exc))
 
 
+def tag_aws_vpc(row: VMRow, dry_run: bool, aws_profile: Optional[str] = None) -> TagResult:
+    try:
+        import boto3
+    except ImportError:
+        return TagResult(row, False, "boto3 not installed")
+
+    profile_note = f" (profile={aws_profile})" if aws_profile else ""
+    if dry_run:
+        return TagResult(row, True,
+                         f"[DRY-RUN] would apply {len(row.tags)} tag(s){profile_note}: {_tags_summary(row.tags)}")
+    try:
+        session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+        ec2 = session.client("ec2", region_name=row.resource_group_or_region)
+        if row.vm_name.startswith("vpc-"):
+            vpc_ids = [row.vm_name]
+        else:
+            resp = ec2.describe_vpcs(Filters=[{"Name": "tag:Name", "Values": [row.vm_name]}])
+            vpc_ids = [v["VpcId"] for v in resp["Vpcs"]]
+            if not vpc_ids:
+                return TagResult(row, False, f"No VPC found with Name={row.vm_name}")
+        ec2.create_tags(Resources=vpc_ids,
+                        Tags=[{"Key": k, "Value": v} for k, v in row.tags.items()])
+        return TagResult(row, True,
+                         f"Applied {len(row.tags)} tag(s) to {vpc_ids}{profile_note}: {_tags_summary(row.tags)}")
+    except Exception as exc:
+        return TagResult(row, False, str(exc))
+
+
+def tag_aws_subnet(row: VMRow, dry_run: bool, aws_profile: Optional[str] = None) -> TagResult:
+    try:
+        import boto3
+    except ImportError:
+        return TagResult(row, False, "boto3 not installed")
+
+    profile_note = f" (profile={aws_profile})" if aws_profile else ""
+    if dry_run:
+        return TagResult(row, True,
+                         f"[DRY-RUN] would apply {len(row.tags)} tag(s){profile_note}: {_tags_summary(row.tags)}")
+    try:
+        session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+        ec2 = session.client("ec2", region_name=row.resource_group_or_region)
+        if row.vm_name.startswith("subnet-"):
+            subnet_ids = [row.vm_name]
+        else:
+            resp = ec2.describe_subnets(Filters=[{"Name": "tag:Name", "Values": [row.vm_name]}])
+            subnet_ids = [s["SubnetId"] for s in resp["Subnets"]]
+            if not subnet_ids:
+                return TagResult(row, False, f"No subnet found with Name={row.vm_name}")
+        ec2.create_tags(Resources=subnet_ids,
+                        Tags=[{"Key": k, "Value": v} for k, v in row.tags.items()])
+        return TagResult(row, True,
+                         f"Applied {len(row.tags)} tag(s) to {subnet_ids}{profile_note}: {_tags_summary(row.tags)}")
+    except Exception as exc:
+        return TagResult(row, False, str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
 def _apply(row: VMRow, dry_run: bool, aws_profile: Optional[str] = None) -> TagResult:
+    rt = row.resource_type
     if row.cloud == "azure":
+        if rt == "vnet":
+            return tag_azure_vnet(row, dry_run)
         return tag_azure_vm(row, dry_run)
     if row.cloud == "aws":
+        if rt == "vpc":
+            return tag_aws_vpc(row, dry_run, aws_profile=aws_profile)
+        if rt == "subnet":
+            return tag_aws_subnet(row, dry_run, aws_profile=aws_profile)
         return tag_aws_vm(row, dry_run, aws_profile=aws_profile)
     return TagResult(row, False, f"Unknown cloud: {row.cloud!r}")
 
@@ -229,7 +335,7 @@ def _apply(row: VMRow, dry_run: bool, aws_profile: Optional[str] = None) -> TagR
 
 def run_cli(input_path: str, dry_run: bool, aws_profile: Optional[str] = None):
     rows = load_input(input_path)
-    print(f"Loaded {len(rows)} VM(s) from {input_path}")
+    print(f"Loaded {len(rows)} resource(s) from {input_path}")
     if dry_run:
         print("DRY-RUN mode — no changes will be applied")
     if aws_profile:
@@ -380,7 +486,7 @@ class TaggerApp:
             self.root.after(0, self.run_btn.config, {"state": "normal"})
             return
 
-        parts = [f"Loaded {len(rows)} VM(s).",
+        parts = [f"Loaded {len(rows)} resource(s).",
                  "DRY-RUN — no changes will be applied." if dry_run else "LIVE mode."]
         if aws_profile:
             parts.append(f"AWS profile: {aws_profile}")
@@ -414,133 +520,165 @@ class TaggerApp:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class DiscoveredVM:
+class DiscoveredResource:
     cloud: str
     subscription_or_account: str
     resource_group_or_region: str
-    vm_name: str
+    resource_name: str
+    resource_type: str
 
 
-def discover_azure_vms(subscription_ids: list[str]) -> list[DiscoveredVM]:
+def _rg_from_id(resource_id: str) -> str:
+    parts = (resource_id or "").split("/")
+    for i, part in enumerate(parts):
+        if part.lower() == "resourcegroups" and i + 1 < len(parts):
+            return parts[i + 1]
+    return ""
+
+
+def _azure_subscription_ids(credential) -> list[str]:
     try:
-        from azure.identity import DefaultAzureCredential
-        from azure.mgmt.compute import ComputeManagementClient
-    except ImportError:
-        print("[ERROR] azure-identity / azure-mgmt-compute not installed", file=sys.stderr)
+        from azure.mgmt.subscription import SubscriptionClient
+        ids = [s.subscription_id for s in SubscriptionClient(credential).subscriptions.list()]
+        print(f"[INFO] Found {len(ids)} Azure subscription(s)")
+        return ids
+    except Exception as exc:
+        print(f"[ERROR] Could not enumerate Azure subscriptions: {exc}", file=sys.stderr)
         return []
 
-    if not subscription_ids:
-        try:
-            from azure.mgmt.subscription import SubscriptionClient
-            credential = DefaultAzureCredential()
-            sub_client = SubscriptionClient(credential)
-            subscription_ids = [s.subscription_id for s in sub_client.subscriptions.list()]
-            print(f"[INFO] Found {len(subscription_ids)} Azure subscription(s)")
-        except Exception as exc:
-            print(f"[ERROR] Could not enumerate Azure subscriptions: {exc}", file=sys.stderr)
-            return []
 
-    vms: list[DiscoveredVM] = []
-    credential = DefaultAzureCredential()
-    for sub_id in subscription_ids:
-        print(f"[INFO] Scanning Azure subscription {sub_id} …")
-        try:
-            client = ComputeManagementClient(credential, sub_id)
-            for vm in client.virtual_machines.list_all():
-                # Resource ID format: /subscriptions/{sub}/resourceGroups/{rg}/providers/…/virtualMachines/{name}
-                parts = (vm.id or "").split("/")
-                rg = ""
-                for i, part in enumerate(parts):
-                    if part.lower() == "resourcegroups" and i + 1 < len(parts):
-                        rg = parts[i + 1]
-                        break
-                vms.append(DiscoveredVM(
-                    cloud="azure",
-                    subscription_or_account=sub_id,
-                    resource_group_or_region=rg,
-                    vm_name=vm.name or "",
-                ))
-        except Exception as exc:
-            print(f"[ERROR] Subscription {sub_id}: {exc}", file=sys.stderr)
-
-    return vms
-
-
-def discover_aws_vms(regions: list[str], aws_profile: Optional[str] = None) -> list[DiscoveredVM]:
+def _discover_azure_vms(sub_id: str, credential) -> list[DiscoveredResource]:
+    from azure.mgmt.compute import ComputeManagementClient
+    results = []
     try:
-        import boto3
-    except ImportError:
-        print("[ERROR] boto3 not installed", file=sys.stderr)
-        return []
+        for vm in ComputeManagementClient(credential, sub_id).virtual_machines.list_all():
+            results.append(DiscoveredResource("azure", sub_id, _rg_from_id(vm.id),
+                                              vm.name or "", "vm"))
+    except Exception as exc:
+        print(f"[ERROR] VMs in subscription {sub_id}: {exc}", file=sys.stderr)
+    return results
 
-    session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
 
-    if not regions:
-        try:
-            ec2_global = session.client("ec2", region_name="us-east-1")
-            resp = ec2_global.describe_regions(Filters=[{"Name": "opt-in-status",
-                                                          "Values": ["opt-in-not-required", "opted-in"]}])
-            regions = [r["RegionName"] for r in resp["Regions"]]
-            print(f"[INFO] Found {len(regions)} AWS region(s)")
-        except Exception as exc:
-            print(f"[ERROR] Could not enumerate AWS regions: {exc}", file=sys.stderr)
-            return []
-
-    # Resolve the account ID once
+def _discover_azure_vnets(sub_id: str, credential) -> list[DiscoveredResource]:
+    from azure.mgmt.network import NetworkManagementClient
+    results = []
     try:
-        sts = session.client("sts")
-        account_id = sts.get_caller_identity()["Account"]
+        for vnet in NetworkManagementClient(credential, sub_id).virtual_networks.list_all():
+            results.append(DiscoveredResource("azure", sub_id, _rg_from_id(vnet.id),
+                                              vnet.name or "", "vnet"))
+    except Exception as exc:
+        print(f"[ERROR] VNets in subscription {sub_id}: {exc}", file=sys.stderr)
+    return results
+
+
+
+def _aws_account_id(session) -> str:
+    try:
+        return session.client("sts").get_caller_identity()["Account"]
     except Exception:
-        account_id = "unknown"
+        return "unknown"
 
-    vms: list[DiscoveredVM] = []
-    for region in regions:
-        print(f"[INFO] Scanning AWS region {region} …")
-        try:
-            ec2 = session.client("ec2", region_name=region)
-            paginator = ec2.get_paginator("describe_instances")
-            for page in paginator.paginate():
-                for reservation in page["Reservations"]:
-                    for instance in reservation["Instances"]:
-                        instance_id = instance["InstanceId"]
-                        vms.append(DiscoveredVM(
-                            cloud="aws",
-                            subscription_or_account=account_id,
-                            resource_group_or_region=region,
-                            vm_name=instance_id,
-                        ))
-        except Exception as exc:
-            print(f"[ERROR] Region {region}: {exc}", file=sys.stderr)
 
-    return vms
+def _aws_regions(session) -> list[str]:
+    try:
+        resp = session.client("ec2", region_name="us-east-1").describe_regions(
+            Filters=[{"Name": "opt-in-status", "Values": ["opt-in-not-required", "opted-in"]}]
+        )
+        regions = [r["RegionName"] for r in resp["Regions"]]
+        print(f"[INFO] Found {len(regions)} AWS region(s)")
+        return regions
+    except Exception as exc:
+        print(f"[ERROR] Could not enumerate AWS regions: {exc}", file=sys.stderr)
+        return []
+
+
+def _discover_aws_vms(region: str, account_id: str, session) -> list[DiscoveredResource]:
+    results = []
+    try:
+        ec2 = session.client("ec2", region_name=region)
+        for page in ec2.get_paginator("describe_instances").paginate():
+            for res in page["Reservations"]:
+                for inst in res["Instances"]:
+                    results.append(DiscoveredResource("aws", account_id, region,
+                                                      inst["InstanceId"], "vm"))
+    except Exception as exc:
+        print(f"[ERROR] Instances in {region}: {exc}", file=sys.stderr)
+    return results
+
+
+def _discover_aws_vpcs(region: str, account_id: str, session) -> list[DiscoveredResource]:
+    results = []
+    try:
+        ec2 = session.client("ec2", region_name=region)
+        for page in ec2.get_paginator("describe_vpcs").paginate():
+            for vpc in page["Vpcs"]:
+                results.append(DiscoveredResource("aws", account_id, region,
+                                                  vpc["VpcId"], "vpc"))
+    except Exception as exc:
+        print(f"[ERROR] VPCs in {region}: {exc}", file=sys.stderr)
+    return results
+
+
+def _discover_aws_subnets(region: str, account_id: str, session) -> list[DiscoveredResource]:
+    results = []
+    try:
+        ec2 = session.client("ec2", region_name=region)
+        for page in ec2.get_paginator("describe_subnets").paginate():
+            for subnet in page["Subnets"]:
+                results.append(DiscoveredResource("aws", account_id, region,
+                                                  subnet["SubnetId"], "subnet"))
+    except Exception as exc:
+        print(f"[ERROR] Subnets in {region}: {exc}", file=sys.stderr)
+    return results
 
 
 def run_discover(cloud: str, output_path: str, subscription_ids: list[str],
                  regions: list[str], aws_profile: Optional[str] = None):
-    vms: list[DiscoveredVM] = []
+    resources: list[DiscoveredResource] = []
 
     if cloud in ("azure", "both"):
-        azure_vms = discover_azure_vms(subscription_ids)
-        print(f"[INFO] Azure: discovered {len(azure_vms)} VM(s)")
-        vms.extend(azure_vms)
+        try:
+            from azure.identity import DefaultAzureCredential
+        except ImportError:
+            print("[ERROR] azure-identity not installed — skipping Azure", file=sys.stderr)
+        else:
+            credential = DefaultAzureCredential()
+            subs = subscription_ids or _azure_subscription_ids(credential)
+            for sub_id in subs:
+                print(f"[INFO] Scanning Azure subscription {sub_id} …")
+                resources.extend(_discover_azure_vms(sub_id, credential))
+                resources.extend(_discover_azure_vnets(sub_id, credential))
+            print(f"[INFO] Azure: discovered {sum(1 for r in resources if r.cloud == 'azure')} resource(s)")
 
     if cloud in ("aws", "both"):
-        aws_vms = discover_aws_vms(regions, aws_profile=aws_profile)
-        print(f"[INFO] AWS: discovered {len(aws_vms)} VM(s)")
-        vms.extend(aws_vms)
+        try:
+            import boto3
+        except ImportError:
+            print("[ERROR] boto3 not installed — skipping AWS", file=sys.stderr)
+        else:
+            session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+            account_id = _aws_account_id(session)
+            aws_regions = regions or _aws_regions(session)
+            for region in aws_regions:
+                print(f"[INFO] Scanning AWS region {region} …")
+                resources.extend(_discover_aws_vms(region, account_id, session))
+                resources.extend(_discover_aws_vpcs(region, account_id, session))
+                resources.extend(_discover_aws_subnets(region, account_id, session))
+            print(f"[INFO] AWS: discovered {sum(1 for r in resources if r.cloud == 'aws')} resource(s)")
 
-    if not vms:
-        print("[WARN] No VMs discovered — output file not written", file=sys.stderr)
+    if not resources:
+        print("[WARN] No resources discovered — output file not written", file=sys.stderr)
         return
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["cloud", "subscription_or_account", "resource_group_or_region", "vm_name", "tags"])
-        for vm in vms:
-            writer.writerow([vm.cloud, vm.subscription_or_account,
-                              vm.resource_group_or_region, vm.vm_name, ""])
+        writer.writerow(["cloud", "subscription_or_account", "resource_group_or_region",
+                          "vm_name", "tags", "resource_type"])
+        for r in resources:
+            writer.writerow([r.cloud, r.subscription_or_account,
+                              r.resource_group_or_region, r.resource_name, "", r.resource_type])
 
-    print(f"\nDiscovered {len(vms)} VM(s) — written to {output_path}")
+    print(f"\nDiscovered {len(resources)} resource(s) — written to {output_path}")
     print("Fill in the 'tags' column, then run:  python tagger.py --input", output_path)
 
 
