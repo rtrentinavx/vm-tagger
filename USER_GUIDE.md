@@ -138,40 +138,37 @@ When you are satisfied with the dry-run output, uncheck **Dry-run** and click **
 
 ---
 
-## Discovering VMs (export for later tagging)
+## Discovering resources (export for later tagging)
 
-Before tagging, you can enumerate all VMs across Azure and AWS and export them to a CSV. Fill in the `tags` column, then use that file as input to the tagger.
+`--discover` enumerates all VMs, VNets, VPCs, and subnets across Azure and AWS and writes a ready-to-fill CSV. Fill in the `tags` column, then pass that file to `--input`.
 
-### Discover all VMs (both clouds)
+### Discover everything (both clouds)
 
 ```bash
 python tagger.py --discover
 ```
 
-This scans every accessible Azure subscription and every enabled AWS region and writes `discovered_vms.csv`.
+Scans every accessible Azure subscription (VMs + VNets) and every enabled AWS region (VMs + VPCs + subnets) and writes `discovered_vms.csv`.
 
-### Discover Azure only
-
-```bash
-python tagger.py --discover --cloud azure
-```
-
-### Discover AWS only
-
-```bash
-python tagger.py --discover --cloud aws --aws-profile bcm-prod
-```
-
-### Scope to specific subscriptions or regions
+### Discover Azure VNets only
 
 ```bash
 python tagger.py --discover --cloud azure \
   --subscription 09ee524e-513d-4f21-b758-43277a3b84b2 \
-  --subscription f11efe01-8a37-4b59-b499-7ac6734f0458
-
-python tagger.py --discover --cloud aws \
-  --region us-east-1 --region eu-west-1
+  --output azure_network.csv
 ```
+
+The output will contain rows with `resource_type=vm` and `resource_type=vnet`. Delete the VM rows if you only want to tag network resources.
+
+### Discover AWS VPCs and subnets only
+
+```bash
+python tagger.py --discover --cloud aws \
+  --region us-east-1 --region eu-west-1 \
+  --output aws_network.csv --aws-profile my-profile
+```
+
+Output contains `resource_type=vm`, `resource_type=vpc`, and `resource_type=subnet` rows. Delete or filter the VM rows as needed.
 
 ### Save to a custom file
 
@@ -179,20 +176,88 @@ python tagger.py --discover --cloud aws \
 python tagger.py --discover --output my_fleet.csv
 ```
 
-### Typical two-step workflow
+### Typical discover → tag workflow
 
 ```bash
-# Step 1 — discover
+# Step 1 — discover all resources
 python tagger.py --discover --output fleet.csv
 
-# Step 2 — fill in the tags column in fleet.csv, then preview:
+# Step 2 — open fleet.csv, fill in the tags column, then preview:
 python tagger.py --input fleet.csv --dry-run
 
 # Step 3 — apply
 python tagger.py --input fleet.csv
 ```
 
-The generated CSV uses the same five-column format as any other input file. The `tags` column is intentionally left empty — fill it in before tagging.
+The generated CSV uses the same column format as any other input file. The `tags` column is intentionally left empty — fill it in before tagging.
+
+---
+
+## Tagging network resources
+
+### Tag an Azure VNet
+
+Add a row with `resource_type=vnet` and the VNet name in `vm_name`:
+
+```csv
+cloud,subscription_or_account,resource_group_or_region,vm_name,tags,resource_type
+azure,09ee524e-513d-4f21-b758-43277a3b84b2,MY-RG,MY-VNET,Environment=Production;Owner=OIT-Cloud;CostCenter=123,vnet
+```
+
+```bash
+python tagger.py --input network_tags.csv --dry-run
+python tagger.py --input network_tags.csv
+```
+
+Required Azure role: **Network Contributor** on the subscription or resource group.
+
+### Tag an AWS VPC
+
+Use the VPC ID (`vpc-…`) or the VPC's `Name` tag in `vm_name`:
+
+```csv
+cloud,subscription_or_account,resource_group_or_region,vm_name,tags,resource_type
+aws,390403887416,us-east-1,vpc-0abc1234def56789a,Environment=Production;Owner=OIT-Cloud,vpc
+aws,390403887416,us-east-1,my-vpc-name,Environment=Staging;Owner=OIT-Cloud,vpc
+```
+
+```bash
+python tagger.py --input vpc_tags.csv --dry-run
+python tagger.py --input vpc_tags.csv
+```
+
+### Tag AWS subnets
+
+Use the subnet ID (`subnet-…`) or the subnet's `Name` tag in `vm_name`:
+
+```csv
+cloud,subscription_or_account,resource_group_or_region,vm_name,tags,resource_type
+aws,390403887416,us-east-1,subnet-0abc1234def56789a,Environment=Production;Tier=Web,subnet
+aws,390403887416,us-east-1,subnet-0def5678abc12345b,Environment=Production;Tier=Data,subnet
+```
+
+```bash
+python tagger.py --input subnet_tags.csv --dry-run
+python tagger.py --input subnet_tags.csv
+```
+
+### Tag VMs and network resources together
+
+You can mix resource types in a single file:
+
+```csv
+cloud,subscription_or_account,resource_group_or_region,vm_name,tags,resource_type
+azure,09ee524e-513d-4f21-b758-43277a3b84b2,MY-RG,my-vm-1,Environment=Production;Owner=OIT-Cloud,vm
+azure,09ee524e-513d-4f21-b758-43277a3b84b2,MY-RG,MY-VNET,Environment=Production;Owner=OIT-Cloud,vnet
+aws,390403887416,us-east-1,i-0abc1234def56789a,Environment=Production;Owner=OIT-Cloud,vm
+aws,390403887416,us-east-1,vpc-0abc1234def56789a,Environment=Production;Owner=OIT-Cloud,vpc
+aws,390403887416,us-east-1,subnet-0abc1234def56789a,Environment=Production;Tier=App,subnet
+```
+
+```bash
+python tagger.py --input mixed_tags.csv --dry-run
+python tagger.py --input mixed_tags.csv
+```
 
 ---
 
@@ -244,15 +309,16 @@ usage: tagger.py [-h] [--input FILE] [--dry-run] [--aws-profile PROFILE]
 ## Example Output
 
 ```
-Loaded 4 VM(s) from vms.csv
+Loaded 5 resource(s) from mixed_tags.csv
 DRY-RUN mode — no changes will be applied
-AWS profile: bcm-prod
 
-[ERR] AZURE  my-vm-1       azure-identity / azure-mgmt-compute not installed
-[DRY] AWS    my-ec2        [DRY-RUN] would apply 3 tag(s) (profile=bcm-prod): Environment=Production  Owner=OIT-Cloud  CostCenter=123
-[DRY] AWS    i-0abc1234    [DRY-RUN] would apply 2 tag(s) (profile=bcm-prod): Environment=Dev  Team=Research
+[OK ] AZURE my-vm-1                  [DRY-RUN] would apply 2 tag(s): Environment=Production  Owner=OIT-Cloud
+[OK ] AZURE MY-VNET                  [DRY-RUN] would apply 2 tag(s): Environment=Production  Owner=OIT-Cloud
+[OK ] AWS   i-0abc1234def56789a      [DRY-RUN] would apply 2 tag(s): Environment=Production  Owner=OIT-Cloud
+[OK ] AWS   vpc-0abc1234def56789a    [DRY-RUN] would apply 2 tag(s): Environment=Production  Owner=OIT-Cloud
+[OK ] AWS   subnet-0abc1234def56789a [DRY-RUN] would apply 2 tag(s): Environment=Production  Tier=App
 
-Done — 3 succeeded, 1 failed
+Done — 5 succeeded, 0 failed
 ```
 
 ---
