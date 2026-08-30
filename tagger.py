@@ -203,9 +203,9 @@ def tag_azure_vnet(row: VMRow, dry_run: bool) -> TagResult:
         client = NetworkManagementClient(credential, row.subscription_or_account)
         vnet = client.virtual_networks.get(row.resource_group_or_region, row.vm_name)
         merged = {**(vnet.tags or {}), **row.tags}
-        client.virtual_networks.begin_update_tags(
+        client.virtual_networks.update_tags(
             row.resource_group_or_region, row.vm_name, {"tags": merged}
-        ).result()
+        )
         return TagResult(row, True, f"Applied {len(row.tags)} tag(s): {_tags_summary(row.tags)}")
     except Exception as exc:
         return TagResult(row, False, str(exc))
