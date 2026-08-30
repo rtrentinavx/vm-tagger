@@ -1,6 +1,6 @@
 azure-identity>=1.17.0
 azure-mgmt-compute>=33.0.0
-azure-mgmt-network>=28.0.0
+azure-mgmt-network>=31.0.0
 azure-mgmt-resource>=23.0.0
 azure-mgmt-subscription>=3.1.0
 boto3>=1.34.0
